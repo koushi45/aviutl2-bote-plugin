@@ -1,0 +1,18 @@
+{
+  "porns": [
+    {
+      "name": "サンプル",
+      "icon": "C:\\media\\sample.png",
+      "vc-directory": "C:\\media\\voice",
+      "img-directory": "C:\\media\\image",
+      "vc-layer": 5,
+      "img-layer": 4,
+      "alias-list": [
+        {
+          "layer": 3,
+          "alias": "C:\\media\\alias\\sample.object"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.25)
+project(Pawnhub LANGUAGES CXX)
+
+add_library(Pawnhub SHARED src/porns_yagi.cpp)
+target_compile_features(Pawnhub PRIVATE cxx_std_20)
+target_compile_definitions(Pawnhub PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(Pawnhub PRIVATE /utf-8 /W4 /permissive- /EHsc)
+target_include_directories(Pawnhub PRIVATE include)
+target_link_libraries(Pawnhub PRIVATE comctl32 comdlg32 dwmapi ole32 shell32 shlwapi uxtheme winmm windowscodecs)
+set_target_properties(Pawnhub PROPERTIES PREFIX "" SUFFIX ".aux2")

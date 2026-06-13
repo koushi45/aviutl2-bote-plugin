@@ -1,0 +1,8 @@
+/build/
+/build-clean/
+/build-final/
+/build-pawnhub/
+/.vs/
+*.user
+*.suo
+*.VC.db
