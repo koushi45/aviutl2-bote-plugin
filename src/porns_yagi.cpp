@@ -41,6 +41,7 @@ constexpr UINT kListId = 1002;
 constexpr UINT kStatusId = 1003;
 constexpr UINT kThumbScaleId = 1004;
 constexpr UINT kThumbScaleLabelId = 1005;
+constexpr UINT_PTR kPreviewTimerId = 1;
 constexpr UINT kPornListId = 3001;
 constexpr UINT kPornAddId = 3002;
 constexpr UINT kPornDeleteId = 3003;
@@ -62,6 +63,10 @@ constexpr UINT kConfigSaveId = 3030;
 constexpr UINT kConfigCancelId = 3031;
 constexpr int kIconButtonWidth = 92;
 constexpr int kIconButtonHeight = 76;
+constexpr int kDefaultIconAreaHeight = kIconButtonHeight * 2 + 4;
+constexpr int kMinimumIconAreaHeight = kIconButtonHeight + 4;
+constexpr int kMinimumLowerAreaHeight = 120;
+constexpr int kSplitterHeight = 6;
 
 HMENU control_id(UINT id) {
     return reinterpret_cast<HMENU>(static_cast<UINT_PTR>(id));
@@ -83,6 +88,9 @@ int g_config_selected = -1;
 bool g_config_loading{};
 HIMAGELIST g_image_list{};
 int g_icon_scroll{};
+int g_icon_wheel_delta{};
+int g_icon_area_height = kDefaultIconAreaHeight;
+bool g_dragging_splitter{};
 bool g_dark_mode{};
 HBRUSH g_dark_brush{};
 constexpr COLORREF kDarkBackground = RGB(32, 32, 32);
@@ -109,7 +117,12 @@ std::vector<Porn> g_porns;
 std::vector<Porn> g_config_porns;
 std::vector<fs::path> g_visible_files;
 std::optional<size_t> g_selected_porn;
+std::optional<fs::path> g_preview_path;
 ViewMode g_view_mode = ViewMode::None;
+
+void show_porn_menu(size_t index);
+LRESULT CALLBACK icon_button_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+                                  UINT_PTR subclass_id, DWORD_PTR reference);
 
 std::wstring utf8_to_wide(std::string_view value) {
     if (value.empty()) return {};
@@ -479,6 +492,60 @@ void clear_icon_buttons() {
         child = next;
     }
     g_icon_scroll = 0;
+    g_icon_wheel_delta = 0;
+}
+
+int icon_columns() {
+    RECT window_rect{};
+    RECT client_rect{};
+    GetWindowRect(g_icon_bar, &window_rect);
+    GetClientRect(g_icon_bar, &client_rect);
+    const int width = static_cast<int>(window_rect.right - window_rect.left);
+    int columns = std::max(1, width / kIconButtonWidth);
+    const int rows = static_cast<int>((g_porns.size() + columns - 1) / columns);
+    if (rows * kIconButtonHeight + 3 > client_rect.bottom) {
+        columns = std::max(1, (width - GetSystemMetrics(SM_CXVSCROLL)) / kIconButtonWidth);
+    }
+    return columns;
+}
+
+void layout_icon_buttons(int scroll) {
+    const int columns = icon_columns();
+    for (size_t i = 0; i < g_porns.size(); ++i) {
+        HWND button = GetDlgItem(g_icon_bar, kIconButtonBase + static_cast<int>(i));
+        if (button) {
+            const int column = static_cast<int>(i) % columns;
+            const int row = static_cast<int>(i) / columns;
+            SetWindowPos(button, nullptr, column * kIconButtonWidth, row * kIconButtonHeight + 2 - scroll,
+                         0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    RedrawWindow(g_icon_bar, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
+void set_icon_scroll_position(HWND hwnd, int position) {
+    SCROLLINFO info{sizeof(info), SIF_ALL};
+    GetScrollInfo(hwnd, SB_VERT, &info);
+    const int maximum = std::max(info.nMin, info.nMax - static_cast<int>(info.nPage) + 1);
+    g_icon_scroll = std::clamp(position, info.nMin, maximum);
+    layout_icon_buttons(g_icon_scroll);
+    info.fMask = SIF_POS;
+    info.nPos = g_icon_scroll;
+    SetScrollInfo(hwnd, SB_VERT, &info, TRUE);
+}
+
+void update_icon_scroll_range() {
+    if (!g_icon_bar) return;
+    RECT rect{};
+    GetClientRect(g_icon_bar, &rect);
+    const int columns = icon_columns();
+    const int rows = static_cast<int>((g_porns.size() + columns - 1) / columns);
+    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE};
+    info.nMin = 0;
+    info.nMax = std::max(0, rows * kIconButtonHeight + 3 - 1);
+    info.nPage = rect.bottom;
+    SetScrollInfo(g_icon_bar, SB_VERT, &info, TRUE);
+    set_icon_scroll_position(g_icon_bar, g_icon_scroll);
 }
 
 void rebuild_icons() {
@@ -490,16 +557,10 @@ void rebuild_icons() {
             WS_CHILD | WS_VISIBLE | (bitmap ? BS_BITMAP : BS_PUSHBUTTON | BS_MULTILINE),
             static_cast<int>(i) * kIconButtonWidth, 2, kIconButtonWidth - 4, kIconButtonHeight - 4,
             g_icon_bar, control_id(kIconButtonBase + static_cast<UINT>(i)), g_instance, nullptr);
+        SetWindowSubclass(button, icon_button_proc, 1, static_cast<DWORD_PTR>(i));
         if (bitmap) SendMessageW(button, BM_SETIMAGE, IMAGE_BITMAP, reinterpret_cast<LPARAM>(bitmap));
     }
-    RECT rect{};
-    GetClientRect(g_icon_bar, &rect);
-    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS};
-    info.nMin = 0;
-    info.nMax = std::max(0, static_cast<int>(g_porns.size()) * kIconButtonWidth - 1);
-    info.nPage = rect.right;
-    info.nPos = 0;
-    SetScrollInfo(g_icon_bar, SB_HORZ, &info, TRUE);
+    update_icon_scroll_range();
 }
 
 bool has_extension(const fs::path& path, const std::vector<std::wstring>& allowed) {
@@ -579,7 +640,8 @@ void rebuild_file_list() {
         item.iItem = static_cast<int>(i);
         item.lParam = static_cast<LPARAM>(i);
         if (g_view_mode == ViewMode::Voice) {
-            item.pszText = const_cast<wchar_t*>(L"▶ 再生");
+            item.pszText = const_cast<wchar_t*>(
+                g_preview_path && *g_preview_path == g_visible_files[i] ? L"■ 停止" : L"▶ 再生");
             ListView_InsertItem(g_list, &item);
             ListView_SetItemText(g_list, static_cast<int>(i), 1, name.data());
         } else {
@@ -597,6 +659,31 @@ void rebuild_file_list() {
         }
     }
     set_status(std::to_wstring(g_visible_files.size()) + L" 件");
+}
+
+void show_porn_files(size_t index) {
+    g_selected_porn = index;
+    g_view_mode = g_porns[index].img_directory.empty() ? ViewMode::Voice : ViewMode::Image;
+    rebuild_file_list();
+}
+
+void refresh_voice_preview_labels() {
+    if (g_view_mode != ViewMode::Voice) return;
+    for (size_t i = 0; i < g_visible_files.size(); ++i) {
+        ListView_SetItemText(
+            g_list, static_cast<int>(i), 0,
+            const_cast<wchar_t*>(g_preview_path && *g_preview_path == g_visible_files[i]
+                                     ? L"■ 停止"
+                                     : L"▶ 再生"));
+    }
+}
+
+void stop_audio_preview() {
+    KillTimer(g_main, kPreviewTimerId);
+    mciSendStringW(L"stop pawnhub_preview", nullptr, 0, nullptr);
+    mciSendStringW(L"close pawnhub_preview", nullptr, 0, nullptr);
+    g_preview_path.reset();
+    refresh_voice_preview_labels();
 }
 
 void create_media_object(const fs::path& path, int ui_layer, bool still_image, bool replace_matching = false) {
@@ -645,14 +732,36 @@ void create_aliases(const Porn& porn) {
     });
 }
 
+void set_selected_text(const Porn& porn) {
+    struct Params { const Porn* porn; } params{&porn};
+    g_edit_handle->call_edit_section_param(&params, [](void* raw, EDIT_SECTION* edit) {
+        OBJECT_HANDLE selected = edit->get_focus_object();
+        if (!selected || edit->count_object_effect(selected, L"テキスト") <= 0) return;
+
+        const Porn& porn = *static_cast<Params*>(raw)->porn;
+        const std::string name = wide_to_utf8(porn.name);
+        edit->set_object_item_value(selected, L"テキスト", L"テキスト", name.c_str());
+    });
+}
+
 void play_audio(const fs::path& path) {
-    mciSendStringW(L"close pawnhub_preview", nullptr, 0, nullptr);
-    std::wstring open = L"open \"" + path.wstring() + L"\" alias pawnhub_preview";
-    if (mciSendStringW(open.c_str(), nullptr, 0, nullptr) == 0) {
-        mciSendStringW(L"play pawnhub_preview", nullptr, 0, nullptr);
-    } else {
-        MessageBoxW(g_main, L"この音声ファイルをプレビュー再生できませんでした。", kPluginName, MB_ICONWARNING);
+    if (g_preview_path && *g_preview_path == path) {
+        stop_audio_preview();
+        return;
     }
+
+    stop_audio_preview();
+    std::wstring open = L"open \"" + path.wstring() + L"\" alias pawnhub_preview";
+    if (mciSendStringW(open.c_str(), nullptr, 0, nullptr) != 0 ||
+        mciSendStringW(L"play pawnhub_preview", nullptr, 0, nullptr) != 0) {
+        mciSendStringW(L"close pawnhub_preview", nullptr, 0, nullptr);
+        MessageBoxW(g_main, L"この音声ファイルをプレビュー再生できませんでした。", kPluginName, MB_ICONWARNING);
+        return;
+    }
+
+    g_preview_path = path;
+    SetTimer(g_main, kPreviewTimerId, 250, nullptr);
+    refresh_voice_preview_labels();
 }
 
 std::optional<std::wstring> choose_path(HWND owner, bool folder) {
@@ -867,15 +976,16 @@ void show_config(HWND owner, HINSTANCE) {
         owner, nullptr, g_instance, nullptr);
 }
 
-void show_porn_menu(size_t index, HWND button) {
+void show_porn_menu(size_t index) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 1, L"alias設置");
     AppendMenuW(menu, MF_STRING, 2, L"vc表示");
     AppendMenuW(menu, MF_STRING, 3, L"img表示");
-    RECT rect{};
-    GetWindowRect(button, &rect);
+    AppendMenuW(menu, MF_STRING, 4, L"name");
+    POINT position{};
+    GetCursorPos(&position);
     int selected = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
-                                  rect.left, rect.bottom, 0, g_main, nullptr);
+                                  position.x, position.y, 0, g_main, nullptr);
     DestroyMenu(menu);
     g_selected_porn = index;
     if (selected == 1) create_aliases(g_porns[index]);
@@ -887,32 +997,74 @@ void show_porn_menu(size_t index, HWND button) {
         g_view_mode = ViewMode::Image;
         rebuild_file_list();
     }
+    if (selected == 4) set_selected_text(g_porns[index]);
+}
+
+LRESULT CALLBACK icon_button_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
+                                  UINT_PTR subclass_id, DWORD_PTR reference) {
+    if (message == WM_CONTEXTMENU) {
+        const size_t index = static_cast<size_t>(reference);
+        if (index < g_porns.size()) show_porn_menu(index);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, icon_button_proc, subclass_id);
+    }
+    return DefSubclassProc(hwnd, message, wparam, lparam);
+}
+
+void layout_main_window(HWND hwnd) {
+    RECT rect{};
+    GetClientRect(hwnd, &rect);
+    const int width = rect.right;
+    const int height = rect.bottom;
+    const int maximum_icon_height = std::max(0, height - kSplitterHeight - kMinimumLowerAreaHeight);
+    const int minimum_icon_height = std::min(kMinimumIconAreaHeight, maximum_icon_height);
+    g_icon_area_height = std::clamp(g_icon_area_height, minimum_icon_height, maximum_icon_height);
+    const int lower_top = g_icon_area_height + kSplitterHeight;
+
+    MoveWindow(g_icon_bar, 0, 0, width, g_icon_area_height, TRUE);
+    MoveWindow(g_search, 8, lower_top + 8, std::max(0, width - 184), 26, TRUE);
+    MoveWindow(GetDlgItem(hwnd, kThumbScaleLabelId), std::max(8, width - 168),
+               lower_top + 13, 100, 20, TRUE);
+    MoveWindow(g_thumb_scale, std::max(8, width - 66), lower_top + 8, 58, 26, TRUE);
+    MoveWindow(g_list, 8, lower_top + 40, std::max(0, width - 16),
+               std::max(0, height - lower_top - 68), TRUE);
+    MoveWindow(g_status, 8, std::max(0, height - 24), std::max(0, width - 16), 20, TRUE);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+bool splitter_contains_y(int y) {
+    return y >= g_icon_area_height && y < g_icon_area_height + kSplitterHeight;
 }
 
 LRESULT CALLBACK icon_bar_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
-    if (message == WM_HSCROLL) {
+    if (message == WM_VSCROLL) {
         SCROLLINFO info{sizeof(info), SIF_ALL};
-        GetScrollInfo(hwnd, SB_HORZ, &info);
+        GetScrollInfo(hwnd, SB_VERT, &info);
         int next = info.nPos;
         switch (LOWORD(wparam)) {
-            case SB_LINELEFT: next -= kIconButtonWidth; break;
-            case SB_LINERIGHT: next += kIconButtonWidth; break;
-            case SB_PAGELEFT: next -= static_cast<int>(info.nPage); break;
-            case SB_PAGERIGHT: next += static_cast<int>(info.nPage); break;
-            case SB_THUMBTRACK: next = info.nTrackPos; break;
+            case SB_LINEUP: next -= kIconButtonHeight; break;
+            case SB_LINEDOWN: next += kIconButtonHeight; break;
+            case SB_PAGEUP: next -= static_cast<int>(info.nPage); break;
+            case SB_PAGEDOWN: next += static_cast<int>(info.nPage); break;
+            case SB_THUMBTRACK:
+            case SB_THUMBPOSITION: next = info.nTrackPos; break;
         }
-        next = std::clamp(next, info.nMin, std::max(info.nMin, info.nMax - static_cast<int>(info.nPage) + 1));
-        ScrollWindowEx(hwnd, g_icon_scroll - next, 0, nullptr, nullptr, nullptr, nullptr, SW_INVALIDATE);
-        g_icon_scroll = next;
-        info.fMask = SIF_POS;
-        info.nPos = next;
-        SetScrollInfo(hwnd, SB_HORZ, &info, TRUE);
+        set_icon_scroll_position(hwnd, next);
         return 0;
     }
-    if (message == WM_SIZE) rebuild_icons();
+    if (message == WM_MOUSEWHEEL) {
+        g_icon_wheel_delta += GET_WHEEL_DELTA_WPARAM(wparam);
+        const int steps = g_icon_wheel_delta / WHEEL_DELTA;
+        g_icon_wheel_delta %= WHEEL_DELTA;
+        if (steps != 0) set_icon_scroll_position(hwnd, g_icon_scroll - steps * kIconButtonHeight);
+        return 0;
+    }
+    if (message == WM_SIZE) update_icon_scroll_range();
     if (message == WM_COMMAND && LOWORD(wparam) >= kIconButtonBase) {
         size_t index = LOWORD(wparam) - kIconButtonBase;
-        if (index < g_porns.size()) show_porn_menu(index, reinterpret_cast<HWND>(lparam));
+        if (index < g_porns.size() && HIWORD(wparam) == BN_CLICKED) show_porn_files(index);
         return 0;
     }
     if (message == WM_CTLCOLORBTN && g_dark_mode) {
@@ -927,7 +1079,7 @@ LRESULT CALLBACK icon_bar_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
 LRESULT CALLBACK main_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
         case WM_CREATE:
-            g_icon_bar = CreateWindowExW(0, kIconBarClass, nullptr, WS_CHILD | WS_VISIBLE | WS_HSCROLL,
+            g_icon_bar = CreateWindowExW(0, kIconBarClass, nullptr, WS_CHILD | WS_VISIBLE | WS_VSCROLL,
                                          0, 0, 0, 0, hwnd, nullptr, g_instance, nullptr);
             g_search = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, nullptr,
                                       WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
@@ -955,15 +1107,66 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
             apply_theme(hwnd);
             return 0;
         case WM_SIZE: {
-            int width = LOWORD(lparam), height = HIWORD(lparam);
-            MoveWindow(g_icon_bar, 0, 0, width, kIconButtonHeight + GetSystemMetrics(SM_CYHSCROLL), TRUE);
-            MoveWindow(g_search, 8, kIconButtonHeight + 22, std::max(0, width - 184), 26, TRUE);
-            MoveWindow(GetDlgItem(hwnd, kThumbScaleLabelId), std::max(8, width - 168),
-                       kIconButtonHeight + 27, 100, 20, TRUE);
-            MoveWindow(g_thumb_scale, std::max(8, width - 66), kIconButtonHeight + 22, 58, 26, TRUE);
-            MoveWindow(g_list, 8, kIconButtonHeight + 54, std::max(0, width - 16),
-                       std::max(0, height - kIconButtonHeight - 82), TRUE);
-            MoveWindow(g_status, 8, std::max(0, height - 24), std::max(0, width - 16), 20, TRUE);
+            layout_main_window(hwnd);
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            RECT icon_rect{};
+            GetWindowRect(g_icon_bar, &icon_rect);
+            POINT cursor{static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam))};
+            if (PtInRect(&icon_rect, cursor)) {
+                return SendMessageW(g_icon_bar, message, wparam, lparam);
+            }
+            break;
+        }
+        case WM_LBUTTONDOWN: {
+            const int y = static_cast<short>(HIWORD(lparam));
+            if (splitter_contains_y(y)) {
+                g_dragging_splitter = true;
+                SetCapture(hwnd);
+                SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+                return 0;
+            }
+            break;
+        }
+        case WM_MOUSEMOVE:
+            if (g_dragging_splitter) {
+                g_icon_area_height = static_cast<short>(HIWORD(lparam));
+                layout_main_window(hwnd);
+                return 0;
+            }
+            break;
+        case WM_LBUTTONUP:
+            if (g_dragging_splitter) {
+                g_dragging_splitter = false;
+                ReleaseCapture();
+                return 0;
+            }
+            break;
+        case WM_CAPTURECHANGED:
+            g_dragging_splitter = false;
+            break;
+        case WM_SETCURSOR:
+            if (LOWORD(lparam) == HTCLIENT) {
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                ScreenToClient(hwnd, &cursor);
+                if (splitter_contains_y(cursor.y)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZENS));
+                    return TRUE;
+                }
+            }
+            break;
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(hwnd, &paint);
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            RECT splitter{0, g_icon_area_height, client.right,
+                          g_icon_area_height + kSplitterHeight};
+            FillRect(dc, &splitter, g_dark_mode ? g_dark_brush
+                                                : reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+            EndPaint(hwnd, &paint);
             return 0;
         }
         case WM_COMMAND:
@@ -976,6 +1179,15 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
             }
             if (LOWORD(wparam) == kThumbScaleId && HIWORD(wparam) == EN_KILLFOCUS) {
                 SetWindowTextW(g_thumb_scale, std::to_wstring(thumbnail_scale()).c_str());
+            }
+            return 0;
+        case WM_TIMER:
+            if (wparam == kPreviewTimerId && g_preview_path) {
+                wchar_t mode[32]{};
+                if (mciSendStringW(L"status pawnhub_preview mode", mode, 32, nullptr) != 0 ||
+                    wcscmp(mode, L"playing") != 0) {
+                    stop_audio_preview();
+                }
             }
             return 0;
         case WM_CTLCOLORSTATIC:
