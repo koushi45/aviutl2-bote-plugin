@@ -54,6 +54,8 @@ constexpr UINT kImgDirEditId = 3015;
 constexpr UINT kImgDirBrowseId = 3016;
 constexpr UINT kVcLayerEditId = 3017;
 constexpr UINT kImgLayerEditId = 3018;
+constexpr UINT kVcRecursiveCheckId = 3019;
+constexpr UINT kImgRecursiveCheckId = 3025;
 constexpr UINT kAliasListId = 3020;
 constexpr UINT kAliasLayerEditId = 3021;
 constexpr UINT kAliasBrowseId = 3022;
@@ -107,6 +109,8 @@ struct Porn {
     std::wstring icon;
     std::wstring vc_directory;
     std::wstring img_directory;
+    bool vc_recursive{};
+    bool img_recursive{};
     int vc_layer = 1;
     int img_layer = 1;
     std::vector<AliasEntry> aliases;
@@ -172,6 +176,7 @@ struct Json {
     enum class Type { Null, String, Number, Object, Array, Boolean } type = Type::Null;
     std::string string;
     int number{};
+    bool boolean{};
     std::map<std::string, Json> object;
     std::vector<Json> array;
 
@@ -227,6 +232,7 @@ private:
                 pos_ += strlen(word);
                 Json result;
                 result.type = type;
+                result.boolean = text_[pos_ - strlen(word)] == 't';
                 return result;
             }
         }
@@ -354,6 +360,11 @@ int json_layer(const Json& object, std::string_view key, int fallback = 1) {
     return value && value->type == Json::Type::Number && value->number >= 1 ? value->number : fallback;
 }
 
+bool json_bool(const Json& object, std::string_view key, bool fallback = false) {
+    const Json* value = object.get(key);
+    return value && value->type == Json::Type::Boolean ? value->boolean : fallback;
+}
+
 bool load_config(std::wstring& error) {
     const auto path = config_path();
     if (!fs::exists(path)) {
@@ -384,6 +395,8 @@ bool load_config(std::wstring& error) {
         porn.icon = json_string(item, "icon");
         porn.vc_directory = json_string(item, "vc-directory");
         porn.img_directory = json_string(item, "img-directory");
+        porn.vc_recursive = json_bool(item, "vc-recursive");
+        porn.img_recursive = json_bool(item, "img-recursive");
         porn.vc_layer = json_layer(item, "vc-layer");
         porn.img_layer = json_layer(item, "img-layer");
         const Json* aliases = item.get("alias-list");
@@ -578,6 +591,15 @@ std::wstring search_text() {
     return text;
 }
 
+std::wstring display_name_for(const fs::path& path, const fs::path& directory, bool recursive) {
+    if (!recursive) return path.filename().wstring();
+    try {
+        return fs::relative(path, directory).wstring();
+    } catch (...) {
+        return path.filename().wstring();
+    }
+}
+
 void rebuild_file_list() {
     ListView_DeleteAllItems(g_list);
     if (g_image_list) {
@@ -590,18 +612,30 @@ void rebuild_file_list() {
 
     const Porn& porn = g_porns[*g_selected_porn];
     const fs::path directory = g_view_mode == ViewMode::Voice ? porn.vc_directory : porn.img_directory;
+    const bool recursive = g_view_mode == ViewMode::Voice ? porn.vc_recursive : porn.img_recursive;
     const std::vector<std::wstring> voice{L".mp3", L".wav", L".m4a", L".aac", L".flac", L".ogg", L".wma"};
     const std::vector<std::wstring> image{L".jpg", L".jpeg", L".png", L".bmp", L".gif", L".webp",
                                           L".mp4", L".avi", L".mov", L".mkv", L".wmv", L".webm"};
+    const std::vector<std::wstring>& allowed = g_view_mode == ViewMode::Voice ? voice : image;
     const std::wstring query = search_text();
     try {
-        for (const auto& entry : fs::directory_iterator(directory)) {
-            if (!entry.is_regular_file() || !has_extension(entry.path(), g_view_mode == ViewMode::Voice ? voice : image)) continue;
-            std::wstring name = entry.path().filename().wstring();
+        auto add_entry = [&](const fs::directory_entry& entry) {
+            if (!entry.is_regular_file() || !has_extension(entry.path(), allowed)) return;
+            std::wstring name = display_name_for(entry.path(), directory, recursive);
             std::wstring lower = name;
             std::transform(lower.begin(), lower.end(), lower.begin(), towlower);
-            if (!query.empty() && lower.find(query) == std::wstring::npos) continue;
+            if (!query.empty() && lower.find(query) == std::wstring::npos) return;
             g_visible_files.push_back(entry.path());
+        };
+        if (recursive) {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                     directory, fs::directory_options::skip_permission_denied)) {
+                add_entry(entry);
+            }
+        } else {
+            for (const auto& entry : fs::directory_iterator(directory)) {
+                add_entry(entry);
+            }
         }
     } catch (...) {
         set_status(L"フォルダを開けません: " + directory.wstring());
@@ -635,7 +669,7 @@ void rebuild_file_list() {
     }
 
     for (size_t i = 0; i < g_visible_files.size(); ++i) {
-        std::wstring name = g_visible_files[i].filename().wstring();
+        std::wstring name = display_name_for(g_visible_files[i], directory, recursive);
         LVITEMW item{LVIF_TEXT | LVIF_PARAM};
         item.iItem = static_cast<int>(i);
         item.lParam = static_cast<LPARAM>(i);
@@ -842,6 +876,14 @@ void set_control_text(HWND parent, UINT id, std::wstring_view text) {
     SetWindowTextW(GetDlgItem(parent, id), std::wstring(text).c_str());
 }
 
+bool control_checked(HWND parent, UINT id) {
+    return SendMessageW(GetDlgItem(parent, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+void set_control_checked(HWND parent, UINT id, bool checked) {
+    SendMessageW(GetDlgItem(parent, id), BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+}
+
 int control_layer(HWND parent, UINT id) {
     const std::wstring text = control_text(parent, id);
     int value = _wtoi(text.c_str());
@@ -877,6 +919,8 @@ std::string serialize_config(const std::vector<Porn>& porns) {
             << "      \"icon\": \"" << json_escape(porn.icon) << "\",\n"
             << "      \"vc-directory\": \"" << json_escape(porn.vc_directory) << "\",\n"
             << "      \"img-directory\": \"" << json_escape(porn.img_directory) << "\",\n"
+            << "      \"vc-recursive\": " << (porn.vc_recursive ? "true" : "false") << ",\n"
+            << "      \"img-recursive\": " << (porn.img_recursive ? "true" : "false") << ",\n"
             << "      \"vc-layer\": " << porn.vc_layer << ",\n"
             << "      \"img-layer\": " << porn.img_layer << ",\n"
             << "      \"alias-list\": [";
@@ -913,6 +957,12 @@ HWND create_button(HWND parent, UINT id, std::wstring_view text) {
                            0, 0, 0, 0, parent, control_id(id), g_instance, nullptr);
 }
 
+HWND create_checkbox(HWND parent, UINT id, std::wstring_view text) {
+    return CreateWindowExW(0, WC_BUTTONW, std::wstring(text).c_str(),
+                           WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                           0, 0, 0, 0, parent, control_id(id), g_instance, nullptr);
+}
+
 void refresh_alias_list() {
     ListView_DeleteAllItems(g_alias_list);
     if (g_config_selected < 0 || static_cast<size_t>(g_config_selected) >= g_config_porns.size()) return;
@@ -936,6 +986,8 @@ void commit_config_porn(HWND hwnd) {
     porn.icon = control_text(hwnd, kIconEditId);
     porn.vc_directory = control_text(hwnd, kVcDirEditId);
     porn.img_directory = control_text(hwnd, kImgDirEditId);
+    porn.vc_recursive = control_checked(hwnd, kVcRecursiveCheckId);
+    porn.img_recursive = control_checked(hwnd, kImgRecursiveCheckId);
     porn.vc_layer = control_layer(hwnd, kVcLayerEditId);
     porn.img_layer = control_layer(hwnd, kImgLayerEditId);
     SendMessageW(g_porn_list, LB_DELETESTRING, g_config_selected, 0);
@@ -954,10 +1006,13 @@ void load_config_porn(HWND hwnd, int index) {
     set_control_text(hwnd, kIconEditId, porn.icon);
     set_control_text(hwnd, kVcDirEditId, porn.vc_directory);
     set_control_text(hwnd, kImgDirEditId, porn.img_directory);
+    set_control_checked(hwnd, kVcRecursiveCheckId, valid && porn.vc_recursive);
+    set_control_checked(hwnd, kImgRecursiveCheckId, valid && porn.img_recursive);
     set_control_text(hwnd, kVcLayerEditId, valid ? std::to_wstring(porn.vc_layer) : L"");
     set_control_text(hwnd, kImgLayerEditId, valid ? std::to_wstring(porn.img_layer) : L"");
     for (UINT id : {kNameEditId, kIconEditId, kIconBrowseId, kVcDirEditId, kVcDirBrowseId,
-                    kImgDirEditId, kImgDirBrowseId, kVcLayerEditId, kImgLayerEditId,
+                    kVcRecursiveCheckId, kImgDirEditId, kImgDirBrowseId, kImgRecursiveCheckId,
+                    kVcLayerEditId, kImgLayerEditId,
                     kAliasLayerEditId, kAliasBrowseId, kAliasDeleteId}) {
         EnableWindow(GetDlgItem(hwnd, id), valid);
     }
@@ -1236,9 +1291,11 @@ LRESULT CALLBACK config_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             create_button(hwnd, kIconBrowseId, L"選択...");
             create_label(hwnd, 3102, L"VCフォルダ");
             create_edit(hwnd, kVcDirEditId);
+            create_checkbox(hwnd, kVcRecursiveCheckId, L"VCフォルダの子孫フォルダも参照する");
             create_button(hwnd, kVcDirBrowseId, L"選択...");
             create_label(hwnd, 3103, L"画像・動画フォルダ");
             create_edit(hwnd, kImgDirEditId);
+            create_checkbox(hwnd, kImgRecursiveCheckId, L"画像・動画フォルダの子孫フォルダも参照する");
             create_button(hwnd, kImgDirBrowseId, L"選択...");
             create_label(hwnd, 3104, L"VC配置レイヤー");
             create_edit(hwnd, kVcLayerEditId, ES_NUMBER);
@@ -1305,6 +1362,9 @@ LRESULT CALLBACK config_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 if (browse) MoveWindow(GetDlgItem(hwnd, browse), edit_x + edit_width + 8, y, browse_width, 26, TRUE);
                 y += 34;
             }
+            MoveWindow(GetDlgItem(hwnd, kVcRecursiveCheckId), edit_x, y, right_width - 145, 24, TRUE);
+            MoveWindow(GetDlgItem(hwnd, kImgRecursiveCheckId), edit_x, y + 24, right_width - 145, 24, TRUE);
+            y += 58;
             MoveWindow(GetDlgItem(hwnd, 3104), right_x, y + 5, 140, 24, TRUE);
             MoveWindow(GetDlgItem(hwnd, kVcLayerEditId), edit_x, y, 90, 26, TRUE);
             MoveWindow(GetDlgItem(hwnd, 3105), edit_x + 110, y + 5, 170, 24, TRUE);

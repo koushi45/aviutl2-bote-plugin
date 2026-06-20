@@ -51,6 +51,8 @@ cmake --build build --config Release
       "icon": "C:\\path\\icon.png",
       "vc-directory": "C:\\path\\voice",
       "img-directory": "C:\\path\\images",
+      "vc-recursive": false,
+      "img-recursive": false,
       "vc-layer": 5,
       "img-layer": 4,
       "alias-list": [
