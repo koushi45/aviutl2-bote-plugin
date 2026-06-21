@@ -21,6 +21,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <vector>
 
@@ -91,6 +92,7 @@ bool g_config_loading{};
 HIMAGELIST g_image_list{};
 int g_icon_scroll{};
 int g_icon_wheel_delta{};
+int g_thumb_wheel_delta{};
 int g_icon_area_height = kDefaultIconAreaHeight;
 bool g_dragging_splitter{};
 bool g_dark_mode{};
@@ -125,6 +127,7 @@ std::optional<fs::path> g_preview_path;
 ViewMode g_view_mode = ViewMode::None;
 
 void show_porn_menu(size_t index);
+void rebuild_file_list();
 LRESULT CALLBACK icon_button_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
                                   UINT_PTR subclass_id, DWORD_PTR reference);
 
@@ -495,6 +498,20 @@ int thumbnail_scale() {
     return std::clamp(_wtoi(text), 25, 300);
 }
 
+bool adjust_thumbnail_scale_from_wheel(WPARAM wparam) {
+    if ((GET_KEYSTATE_WPARAM(wparam) & MK_CONTROL) == 0) return false;
+    if (!g_thumb_scale) return true;
+
+    g_thumb_wheel_delta += GET_WHEEL_DELTA_WPARAM(wparam);
+    const int steps = g_thumb_wheel_delta / WHEEL_DELTA;
+    g_thumb_wheel_delta %= WHEEL_DELTA;
+    if (steps == 0) return true;
+
+    const int scale = std::clamp(thumbnail_scale() + steps * 5, 25, 300);
+    SetWindowTextW(g_thumb_scale, std::to_wstring(scale).c_str());
+    return true;
+}
+
 void clear_icon_buttons() {
     for (HWND child = GetWindow(g_icon_bar, GW_CHILD); child;) {
         HWND next = GetWindow(child, GW_HWNDNEXT);
@@ -580,6 +597,11 @@ bool has_extension(const fs::path& path, const std::vector<std::wstring>& allowe
     std::wstring ext = path.extension().wstring();
     std::transform(ext.begin(), ext.end(), ext.begin(), towlower);
     return std::find(allowed.begin(), allowed.end(), ext) != allowed.end();
+}
+
+bool is_existing_directory(const fs::path& path) {
+    std::error_code error;
+    return fs::is_directory(path, error);
 }
 
 std::wstring search_text() {
@@ -697,7 +719,10 @@ void rebuild_file_list() {
 
 void show_porn_files(size_t index) {
     g_selected_porn = index;
-    g_view_mode = g_porns[index].img_directory.empty() ? ViewMode::Voice : ViewMode::Image;
+    const fs::path image_directory = g_porns[index].img_directory;
+    g_view_mode = !image_directory.empty() && is_existing_directory(image_directory)
+                      ? ViewMode::Image
+                      : ViewMode::Voice;
     rebuild_file_list();
 }
 
@@ -1110,6 +1135,7 @@ LRESULT CALLBACK icon_bar_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lp
         return 0;
     }
     if (message == WM_MOUSEWHEEL) {
+        if (adjust_thumbnail_scale_from_wheel(wparam)) return 0;
         g_icon_wheel_delta += GET_WHEEL_DELTA_WPARAM(wparam);
         const int steps = g_icon_wheel_delta / WHEEL_DELTA;
         g_icon_wheel_delta %= WHEEL_DELTA;
@@ -1166,6 +1192,7 @@ LRESULT CALLBACK main_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam
             return 0;
         }
         case WM_MOUSEWHEEL: {
+            if (adjust_thumbnail_scale_from_wheel(wparam)) return 0;
             RECT icon_rect{};
             GetWindowRect(g_icon_bar, &icon_rect);
             POINT cursor{static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam))};
